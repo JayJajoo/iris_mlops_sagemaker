@@ -70,15 +70,20 @@ def wait_for_training(job_name, session):
     print(f"Waiting for training job {job_name} to complete...")
     
     while True:
-        response = client.describe_training_job(TrainingJobName=job_name)
-        status = response['TrainingJobStatus']
-        
-        print(f"Status: {status}")
-        
-        if status in ['Completed', 'Failed', 'Stopped']:
-            break
-        
-        time.sleep(30)
+        try:
+            response = client.describe_training_job(TrainingJobName=job_name)
+            status = response['TrainingJobStatus']
+            
+            print(f"Status: {status}")
+            
+            if status in ['Completed', 'Failed', 'Stopped']:
+                break
+            
+            time.sleep(30)
+        except Exception as e:
+            print(f"Error checking training status: {e}")
+            time.sleep(30)
+            continue
     
     if status == 'Completed':
         print("Training completed successfully!")
@@ -98,18 +103,26 @@ def get_metrics_from_s3(model_artifacts_path, bucket_name):
     
     # Extract key from S3 path
     # model_artifacts_path format: s3://bucket/path/to/model.tar.gz
-    key_prefix = '/'.join(model_artifacts_path.split('/')[3:-1])  # Remove bucket and model.tar.gz
-    metrics_key = f"{key_prefix}/output/metrics.json"
-    
     try:
-        print(f"Fetching metrics from s3://{bucket_name}/{metrics_key}")
-        response = s3.get_object(Bucket=bucket_name, Key=metrics_key)
+        path_parts = model_artifacts_path.replace('s3://', '').split('/')
+        bucket = path_parts[0]
+        key_prefix = '/'.join(path_parts[1:-1])  # Remove bucket and model.tar.gz
+        metrics_key = f"{key_prefix}/output/metrics.json"
+        
+        print(f"Fetching metrics from s3://{bucket}/{metrics_key}")
+        
+        response = s3.get_object(Bucket=bucket, Key=metrics_key)
         metrics = json.loads(response['Body'].read().decode('utf-8'))
         print(f"Metrics retrieved: {json.dumps(metrics, indent=2)}")
         return metrics
+    except s3.exceptions.NoSuchKey:
+        print(f"Warning: Metrics file not found at s3://{bucket}/{metrics_key}")
+        print("Returning default metrics")
+        return {'accuracy': 0.0, 'note': 'Metrics file not found'}
     except Exception as e:
         print(f"Error fetching metrics: {e}")
-        return None
+        print("Returning default metrics")
+        return {'accuracy': 0.0, 'error': str(e)}
 
 def save_job_info(job_name, model_artifacts, metrics):
     """Save job information for downstream steps"""
@@ -138,19 +151,44 @@ def main():
         session = Session()
         success, model_artifacts = wait_for_training(job_name, session)
         
-        if success:
-            # Get metrics
-            metrics = get_metrics_from_s3(model_artifacts, args.bucket_name)
-            
-            # Save job info
-            save_job_info(job_name, model_artifacts, metrics)
-            
-            # Exit with success
-            exit(0)
-        else:
+        if not success:
+            print("Training job failed")
+            # Still save job info for debugging
+            job_info = {
+                'job_name': job_name,
+                'model_artifacts': None,
+                'metrics': None,
+                'status': 'failed',
+                'timestamp': datetime.now().isoformat()
+            }
+            with open('training_job_info.json', 'w') as f:
+                json.dump(job_info, f, indent=2)
             exit(1)
+        
+        # Get metrics
+        metrics = get_metrics_from_s3(model_artifacts, args.bucket_name)
+        
+        # Ensure metrics is not None
+        if metrics is None:
+            metrics = {'accuracy': 0.0, 'error': 'Failed to retrieve metrics'}
+        
+        # Save job info
+        save_job_info(job_name, model_artifacts, metrics)
+        
+        # Exit with success
+        exit(0)
     else:
         print(f"Training job {job_name} started. Not waiting for completion.")
+        # Save basic job info
+        job_info = {
+            'job_name': job_name,
+            'model_artifacts': None,
+            'metrics': None,
+            'status': 'started',
+            'timestamp': datetime.now().isoformat()
+        }
+        with open('training_job_info.json', 'w') as f:
+            json.dump(job_info, f, indent=2)
         exit(0)
 
 if __name__ == '__main__':

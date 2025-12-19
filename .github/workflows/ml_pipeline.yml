@@ -17,6 +17,7 @@ env:
   ENDPOINT_NAME: iris-endpoint
 
 jobs:
+
   # Job 2: Train Model
   train-model:
     name: Train Model on SageMaker
@@ -59,10 +60,32 @@ jobs:
             --max-depth 5 \
             --wait
           
+          # Verify training_job_info.json exists
+          if [ ! -f training_job_info.json ]; then
+            echo "Error: training_job_info.json not found"
+            exit 1
+          fi
+          
+          # Display file content for debugging
+          echo "Training job info content:"
+          cat training_job_info.json
+          
           # Extract metrics from training_job_info.json
           MODEL_ARTIFACTS=$(jq -r '.model_artifacts' training_job_info.json)
           ACCURACY=$(jq -r '.metrics.accuracy' training_job_info.json)
           
+          # Validate outputs
+          if [ -z "$MODEL_ARTIFACTS" ] || [ "$MODEL_ARTIFACTS" = "null" ]; then
+            echo "Error: MODEL_ARTIFACTS is empty or null"
+            exit 1
+          fi
+          
+          if [ -z "$ACCURACY" ] || [ "$ACCURACY" = "null" ]; then
+            echo "Error: ACCURACY is empty or null"
+            exit 1
+          fi
+          
+          # Set outputs
           echo "model_artifacts=$MODEL_ARTIFACTS" >> $GITHUB_OUTPUT
           echo "accuracy=$ACCURACY" >> $GITHUB_OUTPUT
           
@@ -132,10 +155,17 @@ jobs:
         run: |
           MODEL_ARTIFACTS=${{ needs.train-model.outputs.model_artifacts }}
           
+          # Validate model artifacts
+          if [ -z "$MODEL_ARTIFACTS" ]; then
+            echo "Error: MODEL_ARTIFACTS is empty"
+            echo "Training job may have failed or outputs were not set correctly"
+            exit 1
+          fi
+          
           echo "Deploying model: $MODEL_ARTIFACTS"
           
           python scripts/deploy_endpoint.py \
-            --model-data $MODEL_ARTIFACTS \
+            --model-data "$MODEL_ARTIFACTS" \
             --role-arn ${{ env.SAGEMAKER_ROLE_ARN }} \
             --endpoint-name ${{ env.ENDPOINT_NAME }} \
             --instance-type ml.t2.medium \
