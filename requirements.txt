@@ -1,0 +1,14 @@
+# AWS SDK
+boto3==1.26.137
+sagemaker==2.188.0
+
+# ML Libraries
+scikit-learn==1.2.2
+numpy==1.24.3
+joblib==1.2.0
+
+# Data Processing
+pandas==2.0.1
+
+# Utilities
+python-dateutil==2.8.2

@@ -1,0 +1,223 @@
+name: SageMaker ML Pipeline
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+    branches:
+      - main
+  workflow_dispatch:  # Manual trigger
+
+env:
+  AWS_REGION: us-east-1
+  PYTHON_VERSION: "3.9"
+  S3_BUCKET: ${{ secrets.S3_BUCKET }}
+  SAGEMAKER_ROLE_ARN: ${{ secrets.SAGEMAKER_ROLE_ARN }}
+  ENDPOINT_NAME: iris-endpoint
+
+jobs:
+  # Job 1: Lint and Test
+  lint-and-test:
+    name: Lint and Test Code
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+      
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+      
+      - name: Install dependencies
+        run: |
+          pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install flake8 black pytest
+      
+      - name: Run Black formatter check
+        run: black --check src/ scripts/
+      
+      - name: Run Flake8 linter
+        run: flake8 src/ scripts/ --max-line-length=100 --ignore=E203,W503
+      
+      - name: Run unit tests (if exists)
+        run: |
+          if [ -d "tests" ]; then
+            pytest tests/ -v
+          else
+            echo "No tests directory found, skipping tests"
+          fi
+
+  # Job 2: Train Model
+  train-model:
+    name: Train Model on SageMaker
+    runs-on: ubuntu-latest
+    needs: lint-and-test
+    if: github.ref == 'refs/heads/main'
+    
+    outputs:
+      model_artifacts: ${{ steps.train.outputs.model_artifacts }}
+      accuracy: ${{ steps.train.outputs.accuracy }}
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+      
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+      
+      - name: Install dependencies
+        run: |
+          pip install --upgrade pip
+          pip install -r requirements.txt
+      
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v2
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+      
+      - name: Trigger SageMaker Training
+        id: train
+        run: |
+          python scripts/trigger_training.py \
+            --bucket-name ${{ env.S3_BUCKET }} \
+            --role-arn ${{ env.SAGEMAKER_ROLE_ARN }} \
+            --instance-type ml.m5.large \
+            --n-estimators 100 \
+            --max-depth 5 \
+            --wait
+          
+          # Extract metrics from training_job_info.json
+          MODEL_ARTIFACTS=$(jq -r '.model_artifacts' training_job_info.json)
+          ACCURACY=$(jq -r '.metrics.accuracy' training_job_info.json)
+          
+          echo "model_artifacts=$MODEL_ARTIFACTS" >> $GITHUB_OUTPUT
+          echo "accuracy=$ACCURACY" >> $GITHUB_OUTPUT
+          
+          echo "Model Artifacts: $MODEL_ARTIFACTS"
+          echo "Accuracy: $ACCURACY"
+      
+      - name: Upload training artifacts
+        uses: actions/upload-artifact@v3
+        with:
+          name: training-artifacts
+          path: training_job_info.json
+
+  # Job 3: Evaluate and Gate
+  evaluate-model:
+    name: Evaluate Model Quality
+    runs-on: ubuntu-latest
+    needs: train-model
+    
+    steps:
+      - name: Check accuracy threshold
+        run: |
+          ACCURACY=${{ needs.train-model.outputs.accuracy }}
+          THRESHOLD=0.85
+          
+          echo "Model Accuracy: $ACCURACY"
+          echo "Threshold: $THRESHOLD"
+          
+          # Compare using awk for floating point
+          PASS=$(awk -v acc="$ACCURACY" -v thresh="$THRESHOLD" 'BEGIN {print (acc >= thresh)}')
+          
+          if [ "$PASS" -eq 1 ]; then
+            echo "✓ Model passed accuracy threshold!"
+          else
+            echo "✗ Model failed accuracy threshold"
+            echo "Model accuracy ($ACCURACY) is below threshold ($THRESHOLD)"
+            exit 1
+          fi
+
+  # Job 4: Deploy Endpoint
+  deploy-endpoint:
+    name: Deploy to SageMaker Endpoint
+    runs-on: ubuntu-latest
+    needs: [train-model, evaluate-model]
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+      
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+      
+      - name: Install dependencies
+        run: |
+          pip install --upgrade pip
+          pip install -r requirements.txt
+      
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v2
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+      
+      - name: Deploy or Update Endpoint
+        run: |
+          MODEL_ARTIFACTS=${{ needs.train-model.outputs.model_artifacts }}
+          
+          echo "Deploying model: $MODEL_ARTIFACTS"
+          
+          python scripts/deploy_endpoint.py \
+            --model-data $MODEL_ARTIFACTS \
+            --role-arn ${{ env.SAGEMAKER_ROLE_ARN }} \
+            --endpoint-name ${{ env.ENDPOINT_NAME }} \
+            --instance-type ml.t2.medium \
+            --update-endpoint
+      
+      - name: Upload deployment artifacts
+        uses: actions/upload-artifact@v3
+        with:
+          name: deployment-artifacts
+          path: endpoint_info.json
+
+  # Job 5: Test Endpoint
+  test-endpoint:
+    name: Test Deployed Endpoint
+    runs-on: ubuntu-latest
+    needs: deploy-endpoint
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+      
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+      
+      - name: Install dependencies
+        run: |
+          pip install --upgrade pip
+          pip install -r requirements.txt
+      
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v2
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+      
+      - name: Run Integration Tests
+        run: |
+          python scripts/test_endpoint.py \
+            --endpoint-name ${{ env.ENDPOINT_NAME }} \
+            --region ${{ env.AWS_REGION }}
+      
+      - name: Deployment Summary
+        run: |
+          echo "🎉 Pipeline completed successfully!"
+          echo "Endpoint: ${{ env.ENDPOINT_NAME }}"
+          echo "Accuracy: ${{ needs.train-model.outputs.accuracy }}"
+          echo "Region: ${{ env.AWS_REGION }}"
