@@ -17,16 +17,46 @@ env:
   ENDPOINT_NAME: iris-endpoint
 
 jobs:
+  # Job 1: Lint and Test
+  # lint-and-test:
+  #   name: Lint and Test Code
+  #   runs-on: ubuntu-latest
+    
+  #   steps:
+  #     - name: Checkout code
+  #       uses: actions/checkout@v4
+      
+  #     - name: Set up Python
+  #       uses: actions/setup-python@v5
+  #       with:
+  #         python-version: ${{ env.PYTHON_VERSION }}
+      
+  #     - name: Install dependencies
+  #       run: |
+  #         pip install --upgrade pip
+  #         pip install -r requirements.txt
+  #         pip install flake8 black pytest
+      
+  #     - name: Run Black formatter check
+  #       run: black --check src/ scripts/
+      
+  #     - name: Run Flake8 linter
+  #       run: flake8 src/ scripts/ --max-line-length=100 --ignore=E203,W503
+      
+  #     - name: Run unit tests (if exists)
+  #       run: |
+  #         if [ -d "tests" ]; then
+  #           pytest tests/ -v
+  #         else
+  #           echo "No tests directory found, skipping tests"
+  #         fi
 
   # Job 2: Train Model
   train-model:
     name: Train Model on SageMaker
     runs-on: ubuntu-latest
+    # needs: lint-and-test
     if: github.ref == 'refs/heads/main'
-    
-    outputs:
-      model_artifacts: ${{ steps.train.outputs.model_artifacts }}
-      accuracy: ${{ steps.train.outputs.accuracy }}
     
     steps:
       - name: Checkout code
@@ -60,37 +90,7 @@ jobs:
             --max-depth 5 \
             --wait
           
-          # Verify training_job_info.json exists
-          if [ ! -f training_job_info.json ]; then
-            echo "Error: training_job_info.json not found"
-            exit 1
-          fi
-          
-          # Display file content for debugging
-          echo "Training job info content:"
-          cat training_job_info.json
-          
-          # Extract metrics from training_job_info.json
-          MODEL_ARTIFACTS=$(jq -r '.model_artifacts' training_job_info.json)
-          ACCURACY=$(jq -r '.metrics.accuracy' training_job_info.json)
-          
-          # Validate outputs
-          if [ -z "$MODEL_ARTIFACTS" ] || [ "$MODEL_ARTIFACTS" = "null" ]; then
-            echo "Error: MODEL_ARTIFACTS is empty or null"
-            exit 1
-          fi
-          
-          if [ -z "$ACCURACY" ] || [ "$ACCURACY" = "null" ]; then
-            echo "Error: ACCURACY is empty or null"
-            exit 1
-          fi
-          
-          # Set outputs
-          echo "model_artifacts=$MODEL_ARTIFACTS" >> $GITHUB_OUTPUT
-          echo "accuracy=$ACCURACY" >> $GITHUB_OUTPUT
-          
-          echo "Model Artifacts: $MODEL_ARTIFACTS"
-          echo "Accuracy: $ACCURACY"
+          echo "Training completed, artifact will be uploaded next"
       
       - name: Upload training artifacts
         uses: actions/upload-artifact@v4
@@ -105,11 +105,26 @@ jobs:
     needs: train-model
     
     steps:
+      - name: Download training artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: training-artifacts
+      
       - name: Check accuracy threshold
         run: |
-          ACCURACY=${{ needs.train-model.outputs.accuracy }}
+          echo "=== Reading training artifacts ==="
+          
+          if [ ! -f training_job_info.json ]; then
+            echo "ERROR: training_job_info.json not found!"
+            exit 1
+          fi
+          
+          cat training_job_info.json
+          
+          ACCURACY=$(jq -r '.metrics.accuracy' training_job_info.json)
           THRESHOLD=0.85
           
+          echo "=== Evaluation ==="
           echo "Model Accuracy: $ACCURACY"
           echo "Threshold: $THRESHOLD"
           
@@ -151,18 +166,42 @@ jobs:
           aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
           aws-region: ${{ env.AWS_REGION }}
       
-      - name: Deploy or Update Endpoint
+      - name: Download training artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: training-artifacts
+      
+      - name: Extract model artifacts path
+        id: extract
         run: |
-          MODEL_ARTIFACTS=${{ needs.train-model.outputs.model_artifacts }}
+          echo "=== Reading training_job_info.json from artifact ==="
           
-          # Validate model artifacts
-          if [ -z "$MODEL_ARTIFACTS" ]; then
-            echo "Error: MODEL_ARTIFACTS is empty"
-            echo "Training job may have failed or outputs were not set correctly"
+          if [ ! -f training_job_info.json ]; then
+            echo "ERROR: training_job_info.json not found!"
+            ls -la
             exit 1
           fi
           
-          echo "Deploying model: $MODEL_ARTIFACTS"
+          cat training_job_info.json
+          
+          MODEL_ARTIFACTS=$(jq -r '.model_artifacts' training_job_info.json)
+          
+          echo "=== Extracted Values ==="
+          echo "MODEL_ARTIFACTS: $MODEL_ARTIFACTS"
+          
+          if [ -z "$MODEL_ARTIFACTS" ] || [ "$MODEL_ARTIFACTS" = "null" ]; then
+            echo "ERROR: MODEL_ARTIFACTS is empty or null"
+            exit 1
+          fi
+          
+          echo "model_artifacts=$MODEL_ARTIFACTS" >> $GITHUB_OUTPUT
+      
+      - name: Deploy or Update Endpoint
+        run: |
+          MODEL_ARTIFACTS=${{ steps.extract.outputs.model_artifacts }}
+          
+          echo "=== Deploying Model ==="
+          echo "Model path: $MODEL_ARTIFACTS"
           
           python scripts/deploy_endpoint.py \
             --model-data "$MODEL_ARTIFACTS" \
@@ -204,6 +243,11 @@ jobs:
           aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
           aws-region: ${{ env.AWS_REGION }}
       
+      - name: Download training artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: training-artifacts
+      
       - name: Run Integration Tests
         run: |
           python scripts/test_endpoint.py \
@@ -212,7 +256,9 @@ jobs:
       
       - name: Deployment Summary
         run: |
+          ACCURACY=$(jq -r '.metrics.accuracy' training_job_info.json)
+          
           echo "🎉 Pipeline completed successfully!"
           echo "Endpoint: ${{ env.ENDPOINT_NAME }}"
-          echo "Accuracy: ${{ needs.train-model.outputs.accuracy }}"
+          echo "Accuracy: $ACCURACY"
           echo "Region: ${{ env.AWS_REGION }}"
