@@ -214,7 +214,7 @@ def main():
         # Get metrics
         metrics = get_metrics_from_s3(model_artifacts, args.bucket_name)
         
-        # Ensure metrics is not None
+        # Ensure metrics is not None HI
         if metrics is None:
             metrics = {'accuracy': 0.0, 'error': 'Failed to retrieve metrics'}
         
